@@ -78,6 +78,8 @@ def strip_markdown(text: str) -> str:
         text = re.sub(r'(?<![a-zA-Z0-9])_(.+?)_(?![a-zA-Z0-9])', r'\1', text)
         text = re.sub(r'`(.+?)`', r'\1', text)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    # 裸 URL（http/https）→ 移除，避免 TTS 读出"斜杠斜杠"
+    text = re.sub(r'https?://\S+', '', text)
     # 行级标记 → 整行移除标记
     text = re.sub(r'(?m)^#{1,6}\s+', '', text)
     text = re.sub(r'(?m)^>\s+', '', text)
