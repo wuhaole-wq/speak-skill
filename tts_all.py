@@ -110,11 +110,27 @@ def _play_mci_blocking(path: str):
     ctypes.windll.winmm.mciSendStringW('close tts', None, 0, 0)
 
 
+def _wrap_ssml(text: str) -> str:
+    """包裹为 SSML，开头 80ms 静音防止播放器启动时吞首音节。"""
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="zh-CN">'
+        f'<voice name="{VOICE}">'
+        f'<prosody rate="{RATE}" pitch="{PITCH}">'
+        '<break time="80ms"/>'
+        f'{text}'
+        '</prosody>'
+        '</voice>'
+        '</speak>'
+    )
+
+
 async def _play_ffplay(text: str, ffplay_path: str):
-    """下载完整 MP3 → ffplay 文件播放，确保不丢开头。"""
+    """SSML 包裹 → edge_tts 生成 MP3 → ffplay 文件播放。"""
     mp3 = os.path.join(TEMP, f"tts-{os.getpid()}.mp3")
     try:
-        communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
+        ssml = _wrap_ssml(text)
+        communicate = edge_tts.Communicate(ssml, VOICE, rate=RATE, pitch=PITCH)
         with open(mp3, "wb") as f:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
@@ -135,10 +151,11 @@ async def _play_ffplay(text: str, ffplay_path: str):
 
 
 async def _fallback_mci(text: str):
-    """回退方案：下载完整 MP3 → MCI 播放。"""
+    """回退方案：SSML 包裹 → 下载完整 MP3 → MCI 播放。"""
     mp3 = os.path.join(TEMP, f"tts-{os.getpid()}.mp3")
     try:
-        communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
+        ssml = _wrap_ssml(text)
+        communicate = edge_tts.Communicate(ssml, VOICE, rate=RATE, pitch=PITCH)
         with open(mp3, "wb") as f:
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
