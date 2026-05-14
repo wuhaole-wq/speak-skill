@@ -67,20 +67,38 @@ def _find_ffplay():
 
 def strip_markdown(text: str) -> str:
     """清理 markdown 格式标记和 emoji，返回纯文本。"""
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text = re.sub(r'\*(.+?)\*', r'\1', text)
-    text = re.sub(r'__(.+?)__', r'\1', text)
-    text = re.sub(r'~~(.+?)~~', r'\1', text)
-    text = re.sub(r'`(.+?)`', r'\1', text)
+    # 配对标记 → 先处理包含嵌套的情况（**_text_** 外层**内层_）
+    # 重复两轮确保嵌套标记完全剥离
+    for _ in range(2):
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        text = re.sub(r'__(.+?)__', r'\1', text)
+        text = re.sub(r'~~(.+?)~~', r'\1', text)
+        text = re.sub(r'\*(.+?)\*', r'\1', text)
+        # _斜体_ 需保护 snake_case：仅当 _ 不在 ASCII 字母数字之间时视为标记
+        text = re.sub(r'(?<![a-zA-Z0-9])_(.+?)_(?![a-zA-Z0-9])', r'\1', text)
+        text = re.sub(r'`(.+?)`', r'\1', text)
     text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    # 行级标记 → 整行移除标记
     text = re.sub(r'(?m)^#{1,6}\s+', '', text)
     text = re.sub(r'(?m)^>\s+', '', text)
     text = re.sub(r'(?m)^[\*\-\+]\s+', '', text)
     text = re.sub(r'(?m)^\d+\.\s+', '', text)
+    # 表格
     text = text.replace('|', ' ')
     text = re.sub(r'---+', '', text)
+    # 表情
     text = _EMOJI_RE.sub('', text)
+    # 残留的未配对标记：
+    # * 和 ~ 直接清除（中文文本中无合法用途）
+    text = re.sub(r'\*+', '', text)
+    text = re.sub(r'~+', '', text)
+    # _ 仅在 ASCII 字母数字边界外清除（保护 snake_case）
+    text = re.sub(r'(?<![a-zA-Z0-9])_+(?![a-zA-Z0-9])', '', text)
+    # 反斜杠转义符
+    text = text.replace('\\', '')
+    # 合并多余空格和空行
     text = re.sub(r'  +', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
@@ -102,11 +120,28 @@ async def _stream_ffplay(text: str, ffplay_path: str):
     )
     try:
         communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
+        # 缓冲首批数据，等 ffplay 初始化解码器后再写入，防止开头丢失
+        buffer = bytearray()
+        ffplay_ready = False
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
-                proc.stdin.write(chunk["data"])
+                if not ffplay_ready:
+                    buffer.extend(chunk["data"])
+                    # 积累够 8KB 或最后一个 chunk 时，等 150ms 后写入
+                    if len(buffer) >= 8192:
+                        await asyncio.sleep(0.15)
+                        proc.stdin.write(bytes(buffer))
+                        proc.stdin.flush()
+                        buffer = bytearray()
+                        ffplay_ready = True
+                else:
+                    proc.stdin.write(chunk["data"])
+        # 如果数据太少没触发 8KB 阈值，全部写入
+        if not ffplay_ready and len(buffer) > 0:
+            await asyncio.sleep(0.15)
+            proc.stdin.write(bytes(buffer))
+            proc.stdin.flush()
         proc.stdin.close()
-        # 等待播放完成（最多 300 秒，防止无限阻塞）
         proc.wait(timeout=300)
     except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
         proc.kill()
