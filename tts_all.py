@@ -1,9 +1,9 @@
-"""TTS 语音生成：edge_tts → ffplay 管道流式播放。
+"""TTS 语音生成：edge_tts 单次调用 → ffplay 文件播放。
 
-单次 API 调用保持自然韵律，管道直传 ffplay 实现实时播放：
-- 首块音频数据到达后 ~100ms 即开始播放
-- 无需完整下载，无需临时文件
+单次 API 调用保持整段自然韵律，完整下载后 ffplay 播放确保不丢开头：
 - 自然流畅，无句间割裂
+- 短文本 ~1s 开始播放，长文本 ~2-4s
+- ffplay 不可用时自动回退 MCI
 
 环境变量：
   TTS_TEXT_FILE - 要朗读的文本文件路径（默认：~/.claude/tts-response.txt）
@@ -110,46 +110,28 @@ def _play_mci_blocking(path: str):
     ctypes.windll.winmm.mciSendStringW('close tts', None, 0, 0)
 
 
-async def _stream_ffplay(text: str, ffplay_path: str):
-    """通过 ffplay 管道流式播放。"""
-    proc = subprocess.Popen(
-        [ffplay_path, '-nodisp', '-autoexit', '-loglevel', 'quiet', '-i', 'pipe:0'],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+async def _play_ffplay(text: str, ffplay_path: str):
+    """下载完整 MP3 → ffplay 文件播放，确保不丢开头。"""
+    mp3 = os.path.join(TEMP, f"tts-{os.getpid()}.mp3")
     try:
         communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
-        # 缓冲首批数据，等 ffplay 初始化解码器后再写入，防止开头丢失
-        buffer = bytearray()
-        ffplay_ready = False
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                if not ffplay_ready:
-                    buffer.extend(chunk["data"])
-                    # 积累够 8KB 或最后一个 chunk 时，等 150ms 后写入
-                    if len(buffer) >= 8192:
-                        await asyncio.sleep(0.15)
-                        proc.stdin.write(bytes(buffer))
-                        proc.stdin.flush()
-                        buffer = bytearray()
-                        ffplay_ready = True
-                else:
-                    proc.stdin.write(chunk["data"])
-        # 如果数据太少没触发 8KB 阈值，全部写入
-        if not ffplay_ready and len(buffer) > 0:
-            await asyncio.sleep(0.15)
-            proc.stdin.write(bytes(buffer))
-            proc.stdin.flush()
-        proc.stdin.close()
+        with open(mp3, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+        # ffplay 播放完整文件，不会丢开头
+        proc = subprocess.Popen(
+            [ffplay_path, '-nodisp', '-autoexit', '-loglevel', 'quiet', mp3],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         proc.wait(timeout=300)
-    except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
+    except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    except Exception:
-        proc.kill()
-        proc.wait()
-        raise
+    finally:
+        if os.path.exists(mp3):
+            os.remove(mp3)
 
 
 async def _fallback_mci(text: str):
@@ -188,7 +170,7 @@ async def main():
 
         ffplay_path = _find_ffplay()
         if ffplay_path:
-            await _stream_ffplay(text, ffplay_path)
+            await _play_ffplay(text, ffplay_path)
         else:
             await _fallback_mci(text)
     finally:
