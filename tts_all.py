@@ -1,4 +1,9 @@
-"""TTS 语音生成：通过 Edge TTS 生成 MP3，调用 Win32 MCI 播放。
+"""TTS 语音生成：edge_tts → ffplay 管道流式播放。
+
+单次 API 调用保持自然韵律，管道直传 ffplay 实现实时播放：
+- 首块音频数据到达后 ~100ms 即开始播放
+- 无需完整下载，无需临时文件
+- 自然流畅，无句间割裂
 
 环境变量：
   TTS_TEXT_FILE - 要朗读的文本文件路径（默认：~/.claude/tts-response.txt）
@@ -11,6 +16,7 @@ import sys
 import os
 import ctypes
 import asyncio
+import subprocess
 import edge_tts
 
 HOME = os.path.expanduser("~")
@@ -19,57 +25,120 @@ VOICE = os.environ.get("TTS_VOICE", "zh-CN-XiaoxiaoNeural")
 RATE = os.environ.get("TTS_RATE", "+8%")
 PITCH = os.environ.get("TTS_PITCH", "+0Hz")
 TEMP = os.environ.get("TEMP", os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Temp"))
-LOCK_FILE = os.path.join(TEMP, "tts-lock.txt")  # 锁文件，防止多个语音同时播放
+LOCK_FILE = os.path.join(TEMP, "tts-lock.txt")
 
-# emoji 表情符号正则，用于过滤掉朗读时不需要的表情字符
+# 按优先级查找 ffplay：环境变量、winget 安装目录、PATH
+_FFPLAY_PATHS = [
+    os.environ.get("FFPLAY_PATH", ""),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                 "Microsoft", "WinGet", "Packages",
+                 "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
+                 "ffmpeg-8.1.1-full_build", "bin", "ffplay.exe"),
+]
+
 _EMOJI_RE = re.compile(
-    '[\U0001F600-\U0001F64F'   # 表情符号
-    '\U0001F300-\U0001F5FF'    # 杂项符号和象形文字
-    '\U0001F680-\U0001F6FF'    # 交通和地图符号
-    '\U0001F1E0-\U0001F1FF'    # 国旗
-    '\U0001F900-\U0001F9FF'    # 补充符号
-    '\U0001FA00-\U0001FA6F'    # 象棋符号
-    '\U0001FA70-\U0001FAFF'    # 扩展符号
-    '\U00002702-\U000027B0'    # 印刷装饰符号
-    '\U00002600-\U000026FF'    # 杂项符号
-    '\U0000200D'               # 零宽连接符
-    '\U0000FE0F'               # 变体选择符
-    '\U000020E3'               # 组合封闭按键符
+    '[\U0001F600-\U0001F64F'
+    '\U0001F300-\U0001F5FF'
+    '\U0001F680-\U0001F6FF'
+    '\U0001F1E0-\U0001F1FF'
+    '\U0001F900-\U0001F9FF'
+    '\U0001FA00-\U0001FA6F'
+    '\U0001FA70-\U0001FAFF'
+    '\U00002702-\U000027B0'
+    '\U00002600-\U000026FF'
+    '\U0000200D'
+    '\U0000FE0F'
+    '\U000020E3'
     ']+')
+
+
+def _find_ffplay():
+    """查找 ffplay.exe 的路径。"""
+    for p in _FFPLAY_PATHS:
+        if p and os.path.isfile(p):
+            return p
+    # 尝试 PATH
+    import shutil
+    found = shutil.which("ffplay")
+    if found:
+        return found
+    return None
+
 
 def strip_markdown(text: str) -> str:
     """清理 markdown 格式标记和 emoji，返回纯文本。"""
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)       # **粗体**
-    text = re.sub(r'\*(.+?)\*', r'\1', text)           # *斜体*
-    text = re.sub(r'__(.+?)__', r'\1', text)           # __下划线粗体__
-    text = re.sub(r'~~(.+?)~~', r'\1', text)           # ~~删除线~~
-    text = re.sub(r'`(.+?)`', r'\1', text)             # `代码`
-    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)    # [链接文字](url)
-    text = re.sub(r'(?m)^#{1,6}\s+', '', text)         # ### 标题
-    text = re.sub(r'(?m)^>\s+', '', text)              # > 引用
-    text = re.sub(r'(?m)^[\*\-\+]\s+', '', text)       # * - + 列表标记
-    text = re.sub(r'(?m)^\d+\.\s+', '', text)          # 1. 有序列表
-    text = text.replace('|', ' ')                      # | 表格分隔符
-    text = re.sub(r'---+', '', text)                   # --- 水平线
-    text = _EMOJI_RE.sub('', text)                     # 去除 emoji
-    text = re.sub(r'  +', ' ', text)                   # 合并多余空格
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    text = re.sub(r'(?m)^#{1,6}\s+', '', text)
+    text = re.sub(r'(?m)^>\s+', '', text)
+    text = re.sub(r'(?m)^[\*\-\+]\s+', '', text)
+    text = re.sub(r'(?m)^\d+\.\s+', '', text)
+    text = text.replace('|', ' ')
+    text = re.sub(r'---+', '', text)
+    text = _EMOJI_RE.sub('', text)
+    text = re.sub(r'  +', ' ', text)
     return text.strip()
 
-def play_mp3(path: str):
-    """通过 Win32 MCI 播放 MP3 文件（无窗口、无额外依赖）。"""
+
+def _play_mci_blocking(path: str):
+    """MCI 阻塞播放（ffplay 不可用时的回退方案）。"""
     path = os.path.abspath(path).replace("'", "''")
     ctypes.windll.winmm.mciSendStringW(f'open "{path}" type mpegvideo alias tts', None, 0, 0)
     ctypes.windll.winmm.mciSendStringW('play tts wait', None, 0, 0)
     ctypes.windll.winmm.mciSendStringW('close tts', None, 0, 0)
 
+
+async def _stream_ffplay(text: str, ffplay_path: str):
+    """通过 ffplay 管道流式播放。"""
+    proc = subprocess.Popen(
+        [ffplay_path, '-nodisp', '-autoexit', '-loglevel', 'quiet', '-i', 'pipe:0'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                proc.stdin.write(chunk["data"])
+        proc.stdin.close()
+        # 等待播放完成（最多 300 秒，防止无限阻塞）
+        proc.wait(timeout=300)
+    except (subprocess.TimeoutExpired, BrokenPipeError, OSError):
+        proc.kill()
+        proc.wait()
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
+
+async def _fallback_mci(text: str):
+    """回退方案：下载完整 MP3 → MCI 播放。"""
+    mp3 = os.path.join(TEMP, f"tts-{os.getpid()}.mp3")
+    try:
+        communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
+        with open(mp3, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+        _play_mci_blocking(mp3)
+    finally:
+        if os.path.exists(mp3):
+            os.remove(mp3)
+
+
 async def main():
-    """主流程：获取锁 → 读取文本 → 清理格式 → 生成 MP3 → 播放 → 清理。"""
-    # 等待上一个播放完成（最多等 30 秒）
+    """主流程：获取锁 → 读取文本 → 清理格式 → 流式播放。"""
+    # 等待上一个播放完成（最多等 8 秒）
     waited = 0
-    while os.path.exists(LOCK_FILE) and waited < 30:
-        await asyncio.sleep(0.3)
-        waited += 0.3
-    # 创建锁
+    while os.path.exists(LOCK_FILE) and waited < 8:
+        await asyncio.sleep(0.2)
+        waited += 0.2
     with open(LOCK_FILE, "w") as f:
         f.write("locked")
 
@@ -82,20 +151,15 @@ async def main():
         if not text:
             sys.exit(1)
 
-        # 用进程 ID 作文件名，避免多实例冲突
-        mp3 = os.path.join(TEMP, f"tts-{os.getpid()}.mp3")
-        communicate = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
-        with open(mp3, "wb") as f:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-
-        play_mp3(mp3)
-        os.remove(mp3)
+        ffplay_path = _find_ffplay()
+        if ffplay_path:
+            await _stream_ffplay(text, ffplay_path)
+        else:
+            await _fallback_mci(text)
     finally:
-        # 释放锁（无论成功或失败都要释放）
         if os.path.exists(LOCK_FILE):
             os.remove(LOCK_FILE)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
